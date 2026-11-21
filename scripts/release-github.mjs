@@ -11,7 +11,7 @@
  */
 
 import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const API = 'https://api.github.com'
@@ -142,8 +142,11 @@ async function main() {
   console.log(`created release ${created.data.html_url}`)
 }
 
-main().catch((error) => {
-  console.error(`release failed: ${error.message}`)
-  if (error.detail) console.error(String(error.detail).slice(0, 800))
-  process.exitCode = 1
-})
+// Only run when executed directly; importing this module exposes the helpers.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  main().catch((error) => {
+    console.error(`release failed: ${error.message}`)
+    if (error.detail) console.error(String(error.detail).slice(0, 800))
+    process.exitCode = 1
+  })
+}

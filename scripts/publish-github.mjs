@@ -16,6 +16,8 @@
  * create a repository, which is not granted by default.
  */
 
+import { pathToFileURL } from 'node:url'
+
 const API = 'https://api.github.com'
 
 function parseArgs(argv) {
@@ -199,8 +201,11 @@ async function main() {
 // Imported last so `--dry-list` stays usable without the file planner failing.
 const { planFiles } = await import('./repo-files.mjs')
 
-main().catch((error) => {
-  console.error(`publish failed: ${error.message}`)
-  if (error.detail) console.error(String(error.detail).slice(0, 800))
-  process.exitCode = 1
-})
+// Only run when executed directly; importing this module exposes nothing else.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  main().catch((error) => {
+    console.error(`publish failed: ${error.message}`)
+    if (error.detail) console.error(String(error.detail).slice(0, 800))
+    process.exitCode = 1
+  })
+}
