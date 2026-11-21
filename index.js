@@ -20,6 +20,7 @@ import {
   normalizeSettings,
   pruneSendTimes,
 } from './lib/pacing.js'
+import { fallbackSegments } from './lib/fallback.mjs'
 
 export const name = 'dsh-im-human-pacing'
 
@@ -177,6 +178,64 @@ function turnOf(agents, agent) {
   }
 }
 
+/** Concatenate the text parts of one committed assistant message. */
+function textOfAssistantMessage(event) {
+  const content = event?.data?.message?.content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('')
+    .trim()
+}
+
+/**
+ * The final assistant text of the turn that is about to close.
+ *
+ * The session log is the source of truth, so this reads the newest committed
+ * assistant message rather than trusting a live stream buffer.
+ *
+ * @returns {string} the text, or `''` when the turn produced none
+ */
+function lastAssistantText(agent) {
+  try {
+    const session = agent?.session
+    if (typeof session?.snapshotEvents !== 'function') return ''
+    const events = session.snapshotEvents()
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event?.type === 'turn/end') continue
+      if (event?.type === 'assistant/message') {
+        const text = textOfAssistantMessage(event)
+        if (text) return text
+      }
+      // Never reach back into an earlier turn's reply.
+      if (event?.type === 'turn/start') return ''
+    }
+    return ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * The message that asks the model to split the reply it just wrote.
+ *
+ * It is a steering input, not a user request, so it says so and asks for one
+ * concrete action. It deliberately carries no user-visible content: the user
+ * already got their answer from the model itself.
+ */
+function reminderMessage() {
+  const text = [
+    '[reply-pacing] 这条提醒不是用户说的话。',
+    '你刚刚写完的回复还没有拆成分条气泡发送给用户。',
+    '请立刻调用 ' + SAY_TOOL + '，把刚才那段回复原样拆成 2 条以上的短气泡提交；',
+    '工具会发出除最后一条外的所有气泡，然后你把最后一条作为最终回复原样再输出一次。',
+    '不要新增内容、不要解释这条提醒、不要提及工具。',
+  ].join('\n')
+  return { role: 'user', content: [{ type: 'text', text }] }
+}
+
 /**
  * Per-conversation send bookkeeping.
  *
@@ -231,6 +290,43 @@ class PacingLedger {
 }
 
 /**
+ * Remembers, per conversation, what the plugin already did in the current turn:
+ * whether the model called the tool, and whether the fallback already nudged or
+ * split it. Keyed by the durable turn number so it resets with the turn.
+ */
+class TurnMemory {
+  #byConversation = new Map()
+
+  #record(conversationKey) {
+    let record = this.#byConversation.get(conversationKey)
+    if (!record) {
+      record = { turn: null, usedTool: false, nudged: false, fellBack: false }
+      this.#byConversation.set(conversationKey, record)
+      while (this.#byConversation.size > MAX_CONVERSATIONS) {
+        this.#byConversation.delete(this.#byConversation.keys().next().value)
+      }
+    }
+    return record
+  }
+
+  /** @returns the flags for this conversation and turn, resetting on a new turn. */
+  of(conversationKey, turn) {
+    const record = this.#record(conversationKey)
+    if (record.turn !== turn) {
+      record.turn = turn
+      record.usedTool = false
+      record.nudged = false
+      record.fellBack = false
+    }
+    return record
+  }
+
+  forget(conversationKey) {
+    if (conversationKey) this.#byConversation.delete(conversationKey)
+  }
+}
+
+/**
  * Serialize sends per conversation. Two tool calls in one step must not
  * interleave their bubbles: the reader would see them out of order.
  */
@@ -278,15 +374,39 @@ function readSegments(raw, settings) {
 
 /** The reply-bubble tool definition. */
 function createSayTool({
-  settings, dshIm, resolveConversation, currentTurnOf, ledger, locks, now, random, sleepImpl,
+  settings, dshIm, resolveConversation, currentTurnOf, ledger, locks, now, random, sleepImpl, onToolUsed,
 }) {
-  /** Send every bubble but the last, waiting a human pause before each one. */
-  const deliverPaced = async ({ conversation, segments, signal }) => {
+  /**
+   * Send every bubble but the last, waiting a human pause before each one.
+   *
+   * Shared by the tool and by the fallback, so a reply the model forgot to split
+   * still leaves the chat with the same rhythm. With `sendAll`, every bubble is
+   * sent: the fallback needs that because the channel will deliver the model's
+   * final text separately, and only the tail we suppress there is skipped.
+   */
+  const deliverPaced = async ({ conversation, segments, signal, sendAll = false }) => {
     const chat = ledger.chat(conversation.conversationKey)
     const sent = []
     const waits = []
+    const lastIndex = sendAll ? segments.length : segments.length - 1
     for (let index = 0; index < segments.length; index += 1) {
       const text = segments[index]
+      if (index >= lastIndex) {
+        if (!sendAll) {
+          // The model emits the last bubble itself, so only the part of the
+          // pause its own generation time does not already cover belongs here.
+          const at = now()
+          chat.sendTimes = pruneSendTimes(chat.sendTimes, at)
+          const waitMs = computeSendDelayMs({
+            text, now: at, lastSendAt: chat.lastSendAt,
+            recentCount: chat.sendTimes.length, random, settings,
+          })
+          const tail = Math.max(0, waitMs - FINAL_BUBBLE_ALLOWANCE_MS)
+          await sleepImpl(tail, signal)
+          waits.push(tail)
+          return { sent, remaining: text, waits }
+        }
+      }
       const at = now()
       chat.sendTimes = pruneSendTimes(chat.sendTimes, at)
       const waitMs = computeSendDelayMs({
@@ -297,14 +417,6 @@ function createSayTool({
         random,
         settings,
       })
-      if (index === segments.length - 1) {
-        // The model emits this bubble itself, so only the part of the pause its
-        // own generation time does not already cover belongs here.
-        const tail = Math.max(0, waitMs - FINAL_BUBBLE_ALLOWANCE_MS)
-        await sleepImpl(tail, signal)
-        waits.push(tail)
-        return { sent, remaining: text, waits }
-      }
       await sleepImpl(waitMs, signal)
       signal?.throwIfAborted()
       await dshIm.send(conversation.botId, conversation.draft, text, { signal, format: 'plain' })
@@ -385,6 +497,7 @@ function createSayTool({
             )
           }
           const result = await deliverPaced({ conversation, segments, signal: exec.signal })
+          onToolUsed?.(conversation.conversationKey, currentTurnOf(exec.agent))
           return {
             sentCount: result.sent.length,
             remaining: result.remaining,
@@ -493,6 +606,8 @@ export function createHumanPacingPlugin(internals = {}) {
       /** Whether this agent's step should see the tool at all. */
       const toolAvailable = async (agent) => (await conversationAsync(sessionIdOf(agent))) !== null
 
+      const turnMemory = new TurnMemory()
+
       const { definition: sayTool, deliverPaced } = createSayTool({
         settings,
         dshIm,
@@ -503,6 +618,9 @@ export function createHumanPacingPlugin(internals = {}) {
         now,
         random,
         sleepImpl,
+        onToolUsed: (conversationKey, turn) => {
+          turnMemory.of(conversationKey, turn).usedTool = true
+        },
       })
       ctx.effect(
         () => ctx.tools.register(sayTool, { when: ({ agent }) => toolAvailable(agent) }),
@@ -545,10 +663,60 @@ export function createHumanPacingPlugin(internals = {}) {
         void settle().catch(() => undefined)
       }, { global: true })
 
+      // When the turn is about to close and the model never called the tool,
+      // the chat would otherwise receive one long wall of text. Two layers
+      // answer that, in order of preference:
+      //
+      // 1. `remindOnMiss` — steer one extra step asking the model to split it,
+      //    because the model produces the best bubbles. Once per turn only.
+      // 2. `autoSplitOnMiss` — if the reminder already happened (or is off),
+      //    split the finished reply here and send the leading bubbles.
+      //
+      // The last bubble always stays with the model's own final message, exactly
+      // like the tool path, so nothing is sent twice.
+      ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
+        try {
+          const conversation = await conversationAsync(sessionIdOf(agent))
+          if (!conversation) return
+          const memory = turnMemory.of(conversation.conversationKey, turn)
+          if (memory.usedTool) return
+
+          if (settings.remindOnMiss && !memory.nudged && typeof agent.steer === 'function') {
+            memory.nudged = true
+            agent.steer(reminderMessage())
+            logger.info?.('[im-pacing] the model skipped the reply tool; asked it to split once')
+            return
+          }
+
+          if (!settings.autoSplitOnMiss || memory.fellBack) return
+          const finalText = lastAssistantText(agent)
+          const segments = fallbackSegments(finalText, {
+            targetChars: settings.fallbackTargetChars,
+            maxChars: settings.maxCharsPerSegment,
+            maxSegments: Math.min(settings.maxSegmentsPerTurn, 5),
+          })
+          if (segments.length < 2) return
+          memory.fellBack = true
+          // Send every bubble: the channel delivers the model's own final text
+          // separately, so the tail must be sent here to avoid losing it.
+          await locks.run(conversation.conversationKey, async () => {
+            ledger.observeTurn(conversation.conversationKey, turn)
+            await deliverPaced({ conversation, segments, signal, sendAll: true })
+          })
+          logger.info?.(`[im-pacing] the model skipped the reply tool; split ${segments.length} bubbles`)
+        } catch (error) {
+          // This listener runs at the turn boundary: a failure here must never
+          // break the turn that the user is waiting on.
+          logger.warn?.('[im-pacing] fallback delivery failed:', error?.message ?? error)
+        }
+      }, { global: true })
+
       ctx.on('agent/disposed', ({ agent }) => {
         const sessionId = sessionIdOf(agent)
         void Promise.resolve(conversationAsync(sessionId)).then((conversation) => {
-          if (conversation) ledger.forget(conversation.conversationKey)
+          if (!conversation) return
+          ledger.forget(conversation.conversationKey)
+          turnMemory.forget(conversation.conversationKey)
         }).catch(() => undefined)
       }, { global: true })
     },

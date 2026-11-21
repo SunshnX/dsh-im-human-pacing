@@ -14,3 +14,6 @@
         minGapMs: 900
         maxSegmentsPerTurn: 8
         maxCharsPerSegment: 500
+        remindOnMiss: true
+        autoSplitOnMiss: true
+        fallbackTargetChars: 70

@@ -95,6 +95,46 @@ function setup({ config = {}, conversation, dshIm, agents = createAgents(1) } = 
 const agent = { session: { id: 'session-1' }, id: 'session-1' }
 const exec = { agent, signal: new AbortController().signal }
 
+/**
+ * An agent that can be steered and whose session log the test controls.
+ *
+ * `events` is what `snapshotEvents()` returns; the fallback reads the newest
+ * assistant message from it.
+ */
+function createLiveAgent({ events = [] } = {}) {
+  const steered = []
+  return {
+    steered,
+    session: {
+      id: 'session-1',
+      snapshotEvents: () => events,
+    },
+    id: 'session-1',
+    steer(message) {
+      steered.push(message)
+    },
+  }
+}
+
+/** The committed log for a turn that produced `text` as its reply. */
+function logWithReply(text, turn = 1) {
+  return [
+    { type: 'turn/start', seq: 1, data: { turn } },
+    { type: 'user/message', seq: 2, data: { turn } },
+    {
+      type: 'assistant/message',
+      seq: 3,
+      data: { turn, step: 0, message: { content: [{ type: 'text', text }] } },
+    },
+  ]
+}
+
+/** Invoke the `agent/turn-stopping` listeners the plugin registered. */
+async function stopTurn(registered, { agent: liveAgent, turn = 1, signal = new AbortController().signal }) {
+  const listeners = registered.listeners.filter((entry) => entry.event === 'agent/turn-stopping')
+  for (const { listener } of listeners) await listener({ agent: liveAgent, turn, signal })
+}
+
 test('registers the reply tool and a prompt context', () => {
   const { registered } = setup()
   assert.ok(registered.tools.has(SAY_TOOL))
@@ -317,4 +357,120 @@ test('apply() is the exported entry point', () => {
   const { ctx, registered } = createContext({ dshIm: createDshIm() })
   apply(ctx, {})
   assert.ok(registered.tools.has(SAY_TOOL))
+})
+
+// --- When the model forgets to call the tool -----------------------------
+
+test('a turn that used the tool is left alone', async () => {
+  const live = createLiveAgent({ events: logWithReply('第一句。第二句。第三句。') })
+  const { registered, im } = setup()
+  const { definition } = registered.tools.get(SAY_TOOL)
+  await definition.execute({ segments: ['一', '二'] }, { agent: live, signal: exec.signal })
+  const before = im.sent.length
+  await stopTurn(registered, { agent: live })
+  assert.equal(live.steered.length, 0, 'no reminder once the tool ran')
+  assert.equal(im.sent.length, before, 'no duplicate delivery')
+})
+
+test('a missed tool call triggers exactly one steering reminder', async () => {
+  const live = createLiveAgent({ events: logWithReply('第一句。第二句。') })
+  const { registered, im } = setup()
+  await stopTurn(registered, { agent: live })
+  assert.equal(live.steered.length, 1, 'the model is asked once')
+  assert.match(JSON.stringify(live.steered[0]), /reply-pacing/)
+  assert.match(JSON.stringify(live.steered[0]), /dsh_im_say/)
+  assert.equal(im.sent.length, 0, 'a reminder alone sends nothing')
+})
+
+test('the reminder is not repeated within the same turn', async () => {
+  const live = createLiveAgent({ events: logWithReply('第一句。第二句。') })
+  const { registered } = setup()
+  await stopTurn(registered, { agent: live })
+  await stopTurn(registered, { agent: live })
+  assert.equal(live.steered.length, 1, 'still only one reminder')
+})
+
+test('after the reminder, the reply is split and sent instead', async () => {
+  const text = '第一句内容在这里。第二句内容也在这里。第三句同样在这里。'
+  const live = createLiveAgent({ events: logWithReply(text) })
+  const { registered, im } = setup()
+  await stopTurn(registered, { agent: live })
+  assert.equal(live.steered.length, 1)
+  assert.equal(im.sent.length, 0, 'the first stop only reminds')
+  // The model ignored the reminder: the turn stops again.
+  await stopTurn(registered, { agent: live })
+  assert.ok(im.sent.length >= 1, 'the fallback now speaks for the model')
+  const sentText = im.sent.map((entry) => entry.text).join('')
+  assert.equal(
+    sentText.replace(/\s+/gu, ''),
+    text.replace(/\s+/gu, ''),
+    'the fallback must not lose or invent text',
+  )
+})
+
+test('a fresh turn resets the miss handling', async () => {
+  const agents = createAgents(1)
+  const live = createLiveAgent({ events: logWithReply('第一句。第二句。') })
+  const { registered } = setup({ agents })
+  await stopTurn(registered, { agent: live, turn: 1 })
+  assert.equal(live.steered.length, 1)
+  await stopTurn(registered, { agent: live, turn: 2 })
+  assert.equal(live.steered.length, 2, 'the next turn gets its own reminder')
+})
+
+test('remindOnMiss: false goes straight to the split', async () => {
+  const text = '第一句内容在这里。第二句内容也在这里。第三句同样在这里。'
+  const live = createLiveAgent({ events: logWithReply(text) })
+  const { registered, im } = setup({ config: { remindOnMiss: false } })
+  await stopTurn(registered, { agent: live })
+  assert.equal(live.steered.length, 0, 'no reminder when disabled')
+  assert.ok(im.sent.length >= 1, 'the fallback split it immediately')
+})
+
+test('autoSplitOnMiss: false never sends anything itself', async () => {
+  const live = createLiveAgent({ events: logWithReply('第一句。第二句。第三句。') })
+  const { registered, im } = setup({ config: { remindOnMiss: false, autoSplitOnMiss: false } })
+  await stopTurn(registered, { agent: live })
+  assert.equal(live.steered.length, 0)
+  assert.equal(im.sent.length, 0)
+})
+
+test('a single short reply is not split by the fallback', async () => {
+  const live = createLiveAgent({ events: logWithReply('好的。') })
+  const { registered, im } = setup({ config: { remindOnMiss: false } })
+  await stopTurn(registered, { agent: live })
+  assert.equal(im.sent.length, 0, 'one short bubble needs no pacing')
+})
+
+test('the fallback ignores a reply from a previous turn', async () => {
+  const events = [
+    { type: 'turn/start', seq: 1, data: { turn: 1 } },
+    { type: 'assistant/message', seq: 2, data: { turn: 1, step: 0, message: { content: [{ type: 'text', text: '上一轮很长的回答。另一个句子。' }] } } },
+    // The current turn opened and produced no assistant text yet.
+    { type: 'turn/start', seq: 3, data: { turn: 2 } },
+  ]
+  const live = createLiveAgent({ events })
+  const { registered, im } = setup({ config: { remindOnMiss: false } })
+  await stopTurn(registered, { agent: live, turn: 2 })
+  assert.equal(im.sent.length, 0, 'a stale reply must not be replayed')
+})
+
+test('a failing fallback never breaks the turn', async () => {
+  const live = createLiveAgent({ events: logWithReply('第一句。第二句。第三句。') })
+  const im = createDshIm()
+  im.send = async () => {
+    throw new Error('channel is down')
+  }
+  const { registered } = setup({ dshIm: im, config: { remindOnMiss: false } })
+  // Must resolve, not reject: the listener runs at the turn boundary.
+  await stopTurn(registered, { agent: live })
+})
+
+test('an agent without steer() falls through to the split', async () => {
+  const text = '第一句内容在这里。第二句内容也在这里。第三句同样在这里。'
+  const live = createLiveAgent({ events: logWithReply(text) })
+  delete live.steer
+  const { registered, im } = setup()
+  await stopTurn(registered, { agent: live })
+  assert.ok(im.sent.length >= 1, 'no steer means the fallback handles it')
 })
