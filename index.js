@@ -229,8 +229,9 @@ function reminderMessage() {
   const text = [
     '[reply-pacing] 这条提醒不是用户说的话。',
     '你刚刚写完的回复还没有拆成分条气泡发送给用户。',
-    '请立刻调用 ' + SAY_TOOL + '，把刚才那段回复原样拆成 2 条以上的短气泡提交；',
-    '工具会发出除最后一条外的所有气泡，然后你把最后一条作为最终回复原样再输出一次。',
+    '请立刻调用 ' + SAY_TOOL + '，把刚才那段回复按顺序拆成 2 条以上的短气泡提交；',
+    '工具会发出除最后一条外的所有气泡，然后由你接着把最后一条说完——',
+    '它要和前面那几条连成同一口气，不要重新开头、不要重新回答用户。',
     '不要新增内容、不要解释这条提醒、不要提及工具。',
   ].join('\n')
   return { role: 'user', content: [{ type: 'text', text }] }
@@ -435,11 +436,13 @@ function createSayTool({
     definition: {
       name: SAY_TOOL,
       description:
-        'Send the user a chat reply split into several separate bubbles with human-like '
-        + 'typing pauses. In an enabled IM conversation, call this once per turn instead of '
-        + 'writing one long answer. This tool sends every bubble except the last one, pausing '
-        + 'before each; the LAST bubble is not sent here — write it as your final message, '
-        + 'word for word, with nothing added before or after it.',
+        'Send a chat reply as several consecutive text messages with human-like typing pauses. '
+        + 'In an enabled IM conversation, call this once per turn instead of writing one long '
+        + 'answer. Treat the bubbles as ONE continuous reply delivered in pieces, not as '
+        + 'separate answers. This tool sends every bubble except the last one, pausing before '
+        + 'each. You then emit the last bubble yourself: it is the closing message of the same '
+        + 'sequence, so it must continue directly from the bubble before it — same train of '
+        + 'thought, no fresh greeting and no second answer to the user.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -448,9 +451,11 @@ function createSayTool({
             type: 'array',
             items: { type: 'string' },
             description:
-              'The reply split into short chat bubbles, in order. Two or more entries; each '
-              + 'entry is one bubble. Keep each bubble short and conversational, the way a '
-              + 'person texts. The last entry is what your final message must repeat.',
+              'The reply split into short chat bubbles, in order — like consecutive text '
+              + 'messages, not paragraphs of one document. Two or more entries; each entry is '
+              + 'one bubble. Every entry except the last is sent immediately. The last entry is '
+              + 'handed back to you to emit yourself, so it must read as the natural continuation '
+              + 'of the bubble before it (no restarting the topic, no re-answering the user).',
           },
         },
         required: ['segments'],
@@ -469,9 +474,10 @@ function createSayTool({
         render: (_args, value) => [{
           type: 'text',
           text: value.remaining
-            ? `${value.sentCount} 条气泡已按节奏发出（累计等待 ${value.waitedMs} ms）。`
-              + `现在只输出下面这一段作为最终回复，一字不改：\n\n${value.remaining}`
-            : `${value.sentCount} 条气泡已按节奏发出（累计等待 ${value.waitedMs} ms）。`,
+            ? `${value.sentCount} 条已经发出去了。你还有最后一句没说完——`
+              + `把它紧接着前面那几条说出来就行，别重新开头、别重新回答用户，`
+              + `就当是同一口气里最后补的一句话。原样输出下面这段：\n\n${value.remaining}`
+            : `${value.sentCount} 条已按节奏发出（累计等待 ${value.waitedMs} ms）。`,
         }],
       },
       timeoutMs: TOOL_TIMEOUT_MS,
@@ -639,11 +645,15 @@ export function createHumanPacingPlugin(internals = {}) {
         text: (assembly) => {
           if (!conversationSync(sessionIdOf(assembly?.agent))) return ''
           return [
-            'This reply goes to a chat app, so it must read like a person texting.',
+            'This reply goes to a chat app, so it must read like a person texting —',
+            'several short consecutive messages, not one document broken into pieces.',
             `Before answering, call ${SAY_TOOL} once with the reply split into 2-${settings.maxSegmentsPerTurn}`
               + ` short bubbles of at most ${settings.maxCharsPerSegment} characters each.`,
-            'That tool sends every bubble but the last, pausing like a person typing. Your final',
-            'message must then be the last bubble, word for word, with nothing added.',
+            'The tool sends every bubble except the last one, pausing like a person typing.',
+            'Then speak the last bubble yourself, as the SAME reply still in progress:',
+            'it is the closing message of that sequence, so it must flow straight out of the',
+            'previous bubble. Do not greet again, do not restate the question, do not answer',
+            'the user a second time — just finish the thought the earlier bubbles started.',
             'Each bubble should be one thought: no markdown headings, tables, or long code blocks.',
             'When a single short bubble is the whole answer, do not call the tool; just reply.',
           ].join(' ')

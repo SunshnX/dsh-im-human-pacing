@@ -329,6 +329,39 @@ test('the prompt context appears only inside IM conversations', () => {
   assert.equal(context.text({}), '')
 })
 
+// The last bubble is spoken by the model, and an earlier wording framed it as a
+// "final message", which made the model restart and answer the user again
+// instead of continuing the previous bubble. These assertions pin the wording
+// that keeps the reply one continuous sequence.
+test('the prompt frames the last bubble as a continuation, not a new answer', () => {
+  const { registered } = setup()
+  const text = registered.contexts.get('dsh-im-human-pacing').text({ agent })
+  assert.doesNotMatch(text, /final message/i, 'no "final message" framing')
+  assert.match(text, /same reply still in progress/i)
+  assert.match(text, /flow straight out of the previous bubble/i)
+  assert.match(text, /not answer the user a second time/i)
+})
+
+test('the tool schema tells the model the last bubble continues the previous one', () => {
+  const { registered } = setup()
+  const { parameters, description } = registered.tools.get(SAY_TOOL).definition
+  const segments = parameters.properties.segments.description
+  assert.doesNotMatch(segments, /final message must repeat/i)
+  assert.match(segments, /natural continuation of the bubble before it/i)
+  assert.match(segments, /no restarting the topic/i)
+  assert.match(description, /ONE continuous reply delivered in pieces/i)
+  assert.match(description, /continue directly from the bubble before it/i)
+})
+
+test('the tool result nudges toward continuation rather than a fresh reply', async () => {
+  const { registered } = setup()
+  const { output } = registered.tools.get(SAY_TOOL).definition
+  const rendered = output.render({}, { sentCount: 2, remaining: '最后一句', waitedMs: 0 })[0].text
+  assert.doesNotMatch(rendered, /最终回复/)
+  assert.match(rendered, /别重新开头/)
+  assert.match(rendered, /同一口气/)
+})
+
 test('self-test tool appears only when configured and sends three bubbles', async () => {
   const { registered, im } = setup({ config: { selfTest: true } })
   assert.ok(registered.tools.has(SELF_TEST_TOOL))
