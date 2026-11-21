@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Three chat bubbles arrive one after another, with a typing indicator and pause marks between them">
+  <defs>
+    <linearGradient id="bubbleFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B8DEF"/>
+      <stop offset="1" stop-color="#4A79D8"/>
+    </linearGradient>
+    <linearGradient id="typingFill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8FB0F5"/>
+      <stop offset="1" stop-color="#6E93E8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- first bubble -->
+  <g>
+    <path d="M60 34h286a16 16 0 0 1 16 16v30a16 16 0 0 1-16 16H86l-16 14v-14h-10a16 16 0 0 1-16-16V50a16 16 0 0 1 16-16z" fill="url(#bubbleFill)"/>
+    <rect x="80" y="52" width="196" height="9" rx="4.5" fill="#ffffff" opacity="0.9"/>
+    <rect x="80" y="70" width="128" height="9" rx="4.5" fill="#ffffff" opacity="0.62"/>
+  </g>
+
+  <!-- pause mark: typing, then the next bubble -->
+  <g stroke="#8C9AA8" stroke-width="2" stroke-linecap="round" stroke-dasharray="1 7" opacity="0.85">
+    <line x1="86" y1="112" x2="86" y2="132"/>
+  </g>
+  <g fill="#8C9AA8" opacity="0.9">
+    <circle cx="86" cy="96" r="2.6"/>
+  </g>
+
+  <!-- second bubble: wider, arriving after a longer pause -->
+  <g>
+    <path d="M92 138h350a16 16 0 0 1 16 16v30a16 16 0 0 1-16 16H118l-16 14v-14h-10a16 16 0 0 1-16-16v-30a16 16 0 0 1 16-16z" fill="url(#bubbleFill)"/>
+    <rect x="112" y="156" width="252" height="9" rx="4.5" fill="#ffffff" opacity="0.9"/>
+    <rect x="112" y="174" width="180" height="9" rx="4.5" fill="#ffffff" opacity="0.62"/>
+  </g>
+
+  <g stroke="#8C9AA8" stroke-width="2" stroke-linecap="round" stroke-dasharray="1 7" opacity="0.85">
+    <line x1="118" y1="216" x2="118" y2="236"/>
+  </g>
+  <g fill="#8C9AA8" opacity="0.9">
+    <circle cx="118" cy="200" r="2.6"/>
+  </g>
+
+  <!-- third bubble, still being typed -->
+  <g>
+    <path d="M124 242h214a16 16 0 0 1 16 16v12a16 16 0 0 1-16 16H150l-16 12v-12h-10a16 16 0 0 1-16-16v-12a16 16 0 0 1 16-16z" fill="url(#bubbleFill)" opacity="0.55"/>
+    <rect x="144" y="256" width="120" height="9" rx="4.5" fill="#ffffff" opacity="0.6"/>
+  </g>
+
+  <!-- typing indicator that produced the third bubble -->
+  <g>
+    <rect x="396" y="242" width="96" height="46" rx="23" fill="url(#typingFill)" opacity="0.9"/>
+    <circle cx="420" cy="265" r="6" fill="#ffffff">
+      <animate attributeName="opacity" values="1;0.35;1" dur="1.6s" repeatCount="indefinite" begin="0s"/>
+    </circle>
+    <circle cx="444" cy="265" r="6" fill="#ffffff">
+      <animate attributeName="opacity" values="1;0.35;1" dur="1.6s" repeatCount="indefinite" begin="0.2s"/>
+    </circle>
+    <circle cx="468" cy="265" r="6" fill="#ffffff">
+      <animate attributeName="opacity" values="1;0.35;1" dur="1.6s" repeatCount="indefinite" begin="0.4s"/>
+    </circle>
+  </g>
+
+  <!-- pause scale: three marks of increasing length in the empty right margin -->
+  <g stroke="#7E8B99" stroke-width="3" stroke-linecap="round" opacity="0.65">
+    <line x1="532" y1="64" x2="532" y2="40"/>
+    <line x1="560" y1="64" x2="560" y2="28"/>
+    <line x1="588" y1="64" x2="588" y2="48"/>
+  </g>
+  <g stroke="#7E8B99" stroke-width="1.5" opacity="0.4">
+    <line x1="520" y1="76" x2="600" y2="76"/>
+  </g>
+</svg>

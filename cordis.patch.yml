@@ -1,0 +1,16 @@
+# 在 dsh-im 之后插入拟人分条发送插件。
+# dsh plugin add 会自动装配本文件；卸载时自动移除。
+- insert:
+    - id: dsh-im-human-pacing
+      name: dsh-im-human-pacing
+      config:
+        channels:
+          - weixin
+        msPerUnit: 220
+        typingMinMs: 700
+        typingMaxMs: 6000
+        readingMinMs: 250
+        readingMaxMs: 1400
+        minGapMs: 900
+        maxSegmentsPerTurn: 8
+        maxCharsPerSegment: 500

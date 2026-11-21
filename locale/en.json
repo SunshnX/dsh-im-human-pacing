@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "IM human-paced bubbles",
+    "description": "Let the model decide how many separate messages a reply becomes, and send each bubble with a human typing pause. Enabled for WeChat by default. A reply tool lets the assistant submit several short bubbles in one turn: every bubble but the last is sent immediately through the IM channel with a measured typing-and-reading gap, and the last one is written as the model's own final message so nothing is sent twice. Use it from any WeChat chat connected through the IM bot; outside an enabled channel the tool is not offered. Limitations: each conversation keeps its own pause and per-minute budget, a turn may send at most 8 bubbles of 500 characters each, and the waits are simulated timing, not real typing. Turning the plugin off restores one long reply per turn.",
+    "detail": "docs/DETAIL.md"
+  }
+}
