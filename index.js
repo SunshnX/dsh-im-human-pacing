@@ -25,10 +25,11 @@ export const name = 'dsh-im-human-pacing'
 
 /**
  * `dshIm` is the IM plugin's session→conversation lookup and delivery service.
- * Declaring it here keeps this row inactive, rather than half-working, in a
- * profile that has no IM plugin at all.
+ * `agents` supplies the durable turn number that resets the per-turn budget.
+ * Declaring both keeps this row inactive, rather than half-working, in a profile
+ * that has neither.
  */
-export const inject = ['dshIm', 'tools', 'systemPrompt']
+export const inject = ['dshIm', 'agents', 'tools', 'systemPrompt']
 
 /**
  * Config is read through the standard-schema interface Cordis already calls, so
@@ -113,8 +114,83 @@ function sessionIdOf(agent) {
 }
 
 /**
- * Per-conversation send bookkeeping: when this chat last received a bubble and
- * how many bubbles it received inside the rolling minute.
+ * The durable turn number this agent is currently inside, or `null`.
+ *
+ * `agents.turnBoundaryOf` reads the committed session log, so it is correct even
+ * when no listener has run for the turn yet. A session with no committed turn
+ * (or a Host without the service) reports `null`, which the ledger treats as a
+ * stable key rather than as a reason to reset.
+ */
+/**
+ * The IM conversation this session belongs to, or null.
+ *
+ * The authoritative lookup is `describeConversation`: it answers for every
+ * channel and awaits the channel's own state store. `describeConversationSync`
+ * is only a fast path, and it answers `null` for any channel whose adapter was
+ * built without a synchronous state reader — WeChat is one of those — so it must
+ * never be the only source a listener consults.
+ */
+function createConversationResolver({ dshIm, settings }) {
+  const enabled = (described) => isRecord(described) && isEnabledChannel(described.channel, settings)
+
+  /** Synchronous best effort; `null` also means "not known without awaiting". */
+  const conversationSync = (sessionId) => {
+    if (typeof sessionId !== 'string' || !sessionId) return null
+    try {
+      const described = dshIm.describeConversationSync?.(sessionId) ?? null
+      return enabled(described) ? described : null
+    } catch {
+      return null
+    }
+  }
+
+  /** Authoritative lookup, awaiting the channel state when needed. */
+  const conversationAsync = async (sessionId) => {
+    if (typeof sessionId !== 'string' || !sessionId) return null
+    const known = conversationSync(sessionId)
+    if (known) return known
+    try {
+      const described = await dshIm.describeConversation?.(sessionId)
+      return enabled(described) ? described : null
+    } catch {
+      return null
+    }
+  }
+
+  return { conversationSync, conversationAsync }
+}
+
+/**
+ * The durable turn number this agent is currently inside, or `null`.
+ *
+ * `agents.turnBoundaryOf` reads the committed session log, so it is correct even
+ * when no listener has run for the turn yet. A session with no committed turn
+ * (or a Host without the service) reports `null`, which the ledger treats as a
+ * stable key rather than as a reason to reset.
+ */
+function turnOf(agents, agent) {
+  try {
+    const turn = agents?.turnBoundaryOf?.(agent?.session)?.lastTurn
+    return Number.isSafeInteger(turn) ? turn : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Per-conversation send bookkeeping.
+ *
+ * Two counters live here and they are deliberately independent:
+ *
+ * - `lastSendAt` / `sendTimes` describe this chat's recent sends and only ever
+ *   shrink by ageing out of the rolling minute.
+ * - `segmentsThisTurn` counts bubbles inside ONE turn, keyed by the durable
+ *   turn number.
+ *
+ * The turn key must come from the session log, never from "the last time we saw
+ * a message": a tool call can arrive before any listener has observed the new
+ * turn, and a per-turn counter that never resets rejects every later call with
+ * "over the limit" while nothing has been sent yet.
  */
 class PacingLedger {
   #byConversation = new Map()
@@ -132,8 +208,15 @@ class PacingLedger {
     return record
   }
 
-  /** A new user turn starts: the per-turn bubble budget is fresh again. */
-  startTurn(conversationKey, turn) {
+  /**
+   * Bind the record to one durable turn, resetting the per-turn budget when the
+   * turn number moves. Called both from the inbox listener and from every tool
+   * execution, so the counter is correct even if no listener ran first.
+   *
+   * A `turn === null` (the session has no committed turn yet) keeps whatever
+   * budget the record already had for that same null turn.
+   */
+  observeTurn(conversationKey, turn) {
     if (!conversationKey) return
     const record = this.chat(conversationKey)
     if (record.turn === turn) return
@@ -194,7 +277,9 @@ function readSegments(raw, settings) {
 }
 
 /** The reply-bubble tool definition. */
-function createSayTool({ settings, dshIm, resolveConversation, ledger, locks, now, random, sleepImpl }) {
+function createSayTool({
+  settings, dshIm, resolveConversation, currentTurnOf, ledger, locks, now, random, sleepImpl,
+}) {
   /** Send every bubble but the last, waiting a human pause before each one. */
   const deliverPaced = async ({ conversation, segments, signal }) => {
     const chat = ledger.chat(conversation.conversationKey)
@@ -288,6 +373,10 @@ function createSayTool({ settings, dshIm, resolveConversation, ledger, locks, no
         const { segments } = readSegments(args?.segments, settings)
         const conversation = await resolveConversation(exec.agent)
         return locks.run(conversation.conversationKey, async () => {
+          // Read the turn from the session log itself rather than trusting that
+          // a listener already observed the new turn; this is what keeps the
+          // per-turn budget correct on every call.
+          ledger.observeTurn(conversation.conversationKey, currentTurnOf(exec.agent))
           const chat = ledger.chat(conversation.conversationKey)
           if (chat.segmentsThisTurn + segments.length > settings.maxSegmentsPerTurn) {
             throw toolError(
@@ -380,31 +469,11 @@ export function createHumanPacingPlugin(internals = {}) {
       const ledger = new PacingLedger()
       const locks = new ConversationLocks()
       const dshIm = ctx.dshIm
-
-      /** The IM conversation this session belongs to, or null. */
-      const conversationOf = (sessionId) => {
-        if (typeof sessionId !== 'string' || !sessionId) return null
-        let described = null
-        try {
-          described = dshIm.describeConversationSync?.(sessionId) ?? null
-        } catch {
-          return null
-        }
-        if (!isRecord(described) || !isEnabledChannel(described.channel, settings)) return null
-        return described
-      }
+      const agents = ctx.agents
+      const { conversationSync, conversationAsync } = createConversationResolver({ dshIm, settings })
 
       const resolveConversation = async (agent) => {
-        const sessionId = sessionIdOf(agent)
-        let described = conversationOf(sessionId)
-        if (!described) {
-          // The synchronous lookup only sees already-loaded channel state.
-          try {
-            described = await dshIm.describeConversation(sessionId)
-          } catch {
-            described = null
-          }
-        }
+        const described = await conversationAsync(sessionIdOf(agent))
         if (!isRecord(described)) {
           throw toolError(
             '当前会话不属于 IM 渠道，不需要分条发送；正常回答即可。',
@@ -422,19 +491,18 @@ export function createHumanPacingPlugin(internals = {}) {
       }
 
       /** Whether this agent's step should see the tool at all. */
-      const toolAvailable = async (agent) => {
-        const sessionId = sessionIdOf(agent)
-        if (conversationOf(sessionId)) return true
-        try {
-          const described = await dshIm.describeConversation(sessionId)
-          return isRecord(described) && isEnabledChannel(described.channel, settings)
-        } catch {
-          return false
-        }
-      }
+      const toolAvailable = async (agent) => (await conversationAsync(sessionIdOf(agent))) !== null
 
       const { definition: sayTool, deliverPaced } = createSayTool({
-        settings, dshIm, resolveConversation, ledger, locks, now, random, sleepImpl,
+        settings,
+        dshIm,
+        resolveConversation,
+        currentTurnOf: (agent) => turnOf(agents, agent),
+        ledger,
+        locks,
+        now,
+        random,
+        sleepImpl,
       })
       ctx.effect(
         () => ctx.tools.register(sayTool, { when: ({ agent }) => toolAvailable(agent) }),
@@ -451,7 +519,7 @@ export function createHumanPacingPlugin(internals = {}) {
         name: PROMPT_CONTEXT_NAME,
         order: PROMPT_CONTEXT_ORDER,
         text: (assembly) => {
-          if (!conversationOf(sessionIdOf(assembly?.agent))) return ''
+          if (!conversationSync(sessionIdOf(assembly?.agent))) return ''
           return [
             'This reply goes to a chat app, so it must read like a person texting.',
             `Before answering, call ${SAY_TOOL} once with the reply split into 2-${settings.maxSegmentsPerTurn}`
@@ -464,14 +532,24 @@ export function createHumanPacingPlugin(internals = {}) {
         },
       }), `systemPrompt.context(${PROMPT_CONTEXT_NAME})`)
 
+      // A new turn starts a fresh bubble budget. This listener is only an
+      // accelerator: the tool re-reads the turn itself, so a missed event can
+      // never leave a stale counter behind. It has to await the channel lookup,
+      // because the synchronous one answers null for channels such as WeChat.
       ctx.on('agent/inbox/claimed', ({ agent, turn }) => {
-        const conversation = conversationOf(sessionIdOf(agent))
-        if (conversation) ledger.startTurn(conversation.conversationKey, turn)
+        const sessionId = sessionIdOf(agent)
+        const settle = async () => {
+          const conversation = await conversationAsync(sessionId)
+          if (conversation) ledger.observeTurn(conversation.conversationKey, turn)
+        }
+        void settle().catch(() => undefined)
       }, { global: true })
 
       ctx.on('agent/disposed', ({ agent }) => {
-        const conversation = conversationOf(sessionIdOf(agent))
-        if (conversation) ledger.forget(conversation.conversationKey)
+        const sessionId = sessionIdOf(agent)
+        void Promise.resolve(conversationAsync(sessionId)).then((conversation) => {
+          if (conversation) ledger.forget(conversation.conversationKey)
+        }).catch(() => undefined)
       }, { global: true })
     },
   })

@@ -4,10 +4,11 @@ import test from 'node:test'
 import { SAY_TOOL, SELF_TEST_TOOL, apply, createHumanPacingPlugin } from '../index.js'
 
 /** A fake Cordis context exposing only what this plugin registers on. */
-function createContext({ dshIm }) {
+function createContext({ dshIm, agents }) {
   const registered = { tools: new Map(), contexts: new Map(), listeners: [] }
   const ctx = {
     dshIm,
+    ...(agents === undefined ? {} : { agents }),
     logger: () => ({ info() {}, warn() {}, error() {}, debug() {} }),
     effect(factory) {
       return factory() ?? (() => {})
@@ -32,12 +33,23 @@ function createContext({ dshIm }) {
   return { ctx, registered }
 }
 
-/** A `dshIm` stand-in that records sends. */
-function createDshIm({ conversation = { channel: 'weixin', botId: 'bot-1', conversationKey: 'p2p:user-1@im.wechat' } } = {}) {
+/**
+ * A `dshIm` stand-in that records sends.
+ *
+ * `withSync: false` reproduces the real WeChat adapter, which is built without a
+ * synchronous state reader: `describeConversationSync` is then permanently
+ * `null` while the awaited lookup still answers.
+ */
+function createDshIm({
+  conversation = { channel: 'weixin', botId: 'bot-1', conversationKey: 'p2p:user-1@im.wechat' },
+  withSync = true,
+} = {}) {
   const sent = []
   return {
     sent,
-    describeConversationSync: (sessionId) => (sessionId === 'session-1' ? conversation : null),
+    describeConversationSync: withSync
+      ? (sessionId) => (sessionId === 'session-1' ? conversation : null)
+      : () => null,
     async describeConversation(sessionId) {
       return sessionId === 'session-1' ? conversation : null
     },
@@ -54,8 +66,17 @@ function createDshIm({ conversation = { channel: 'weixin', botId: 'bot-1', conve
   }
 }
 
+/** A `ctx.agents` stand-in whose reported turn the test controls. */
+function createAgents(initialTurn = 1) {
+  const state = { turn: initialTurn }
+  return {
+    state,
+    turnBoundaryOf: () => ({ lastTurn: state.turn }),
+  }
+}
+
 /** Drive the plugin with an injected clock, sleep, and randomness. */
-function setup({ config = {}, conversation, dshIm } = {}) {
+function setup({ config = {}, conversation, dshIm, agents = createAgents(1) } = {}) {
   const clock = { now: 1_000_000, waits: [] }
   const im = dshIm ?? createDshIm(conversation ? { conversation } : {})
   const plugin = createHumanPacingPlugin({
@@ -66,9 +87,9 @@ function setup({ config = {}, conversation, dshIm } = {}) {
       clock.now += ms
     },
   })
-  const { ctx, registered } = createContext({ dshIm: im })
+  const { ctx, registered } = createContext({ dshIm: im, agents })
   plugin.apply(ctx, config)
-  return { im, clock, registered, ctx }
+  return { im, clock, registered, ctx, agents }
 }
 
 const agent = { session: { id: 'session-1' }, id: 'session-1' }
@@ -156,9 +177,8 @@ test('refuses to pace outside an IM conversation', async () => {
 })
 
 test('honors maxSegmentsPerTurn across one turn and resets on the next', async () => {
-  const { registered, im } = setup({ config: { maxSegmentsPerTurn: 3 } })
-  const claimed = registered.listeners.find((entry) => entry.event === 'agent/inbox/claimed')
-  claimed.listener({ agent, turn: 1 })
+  const agents = createAgents(1)
+  const { registered, im } = setup({ config: { maxSegmentsPerTurn: 3 }, agents })
   const { definition } = registered.tools.get(SAY_TOOL)
   await definition.execute({ segments: ['a', 'b', 'c'] }, exec)
   assert.equal(im.sent.length, 2)
@@ -166,9 +186,71 @@ test('honors maxSegmentsPerTurn across one turn and resets on the next', async (
     () => definition.execute({ segments: ['d', 'e'] }, exec),
     /本轮气泡数超过上限/,
   )
-  claimed.listener({ agent, turn: 2 })
+  // A new turn must hand the budget back.
+  agents.state.turn = 2
   const result = await definition.execute({ segments: ['f', 'g'] }, exec)
   assert.equal(result.sentCount, 1)
+})
+
+// Regression: the user's next turn was rejected with "over the limit 8" before
+// a single bubble had been sent, because the counter never reset. Two
+// independent causes are covered here.
+test('regression: the per-turn budget resets even if no inbox event was seen', async () => {
+  const agents = createAgents(1)
+  const { registered, im } = setup({ config: { maxSegmentsPerTurn: 4 }, agents })
+  const { definition } = registered.tools.get(SAY_TOOL)
+  // Fill the budget in turn 1 without any listener having been invoked.
+  await definition.execute({ segments: ['a', 'b', 'c', 'd'] }, exec)
+  assert.equal(im.sent.length, 3)
+  await assert.rejects(() => definition.execute({ segments: ['e', 'f'] }, exec), /超过上限/)
+  // Turn 2 arrives; nothing dispatched `agent/inbox/claimed` for it.
+  agents.state.turn = 2
+  const first = await definition.execute({ segments: ['一', '二'] }, exec)
+  assert.equal(first.sentCount, 1, 'a fresh turn must be allowed to speak again')
+  assert.equal(im.sent.length, 4)
+})
+
+test('regression: a channel without a synchronous lookup still resets the budget', async () => {
+  // This is the real WeChat adapter shape: describeConversationSync is null,
+  // only the awaited lookup answers.
+  const agents = createAgents(1)
+  const im = createDshIm({ withSync: false })
+  const { registered } = setup({ config: { maxSegmentsPerTurn: 4 }, dshIm: im, agents })
+  const { definition } = registered.tools.get(SAY_TOOL)
+
+  // The tool is still offered, because availability awaits the real lookup.
+  const { options } = registered.tools.get(SAY_TOOL)
+  assert.equal(await options.when({ agent }), true, 'WeChat must still see the tool')
+
+  await definition.execute({ segments: ['a', 'b', 'c', 'd'] }, exec)
+  assert.equal(im.sent.length, 3)
+
+  agents.state.turn = 2
+  const result = await definition.execute({ segments: ['一', '二'] }, exec)
+  assert.equal(result.sentCount, 1, 'the new turn must not inherit the old count')
+})
+
+test('regression: consecutive turns each get a full budget', async () => {
+  const agents = createAgents(1)
+  const { registered, im } = setup({ config: { maxSegmentsPerTurn: 3 }, agents })
+  const { definition } = registered.tools.get(SAY_TOOL)
+  for (let turn = 1; turn <= 4; turn += 1) {
+    agents.state.turn = turn
+    const before = im.sent.length
+    const result = await definition.execute({ segments: ['一', '二', '三'] }, exec)
+    assert.equal(result.sentCount, 2, `turn ${turn} should send 2 bubbles`)
+    assert.equal(im.sent.length, before + 2, `turn ${turn} must not be blocked`)
+  }
+})
+
+test('a Host without the agents service still paces and still resets', async () => {
+  const { registered, im } = setup({ config: { maxSegmentsPerTurn: 3 } })
+  // No ctx.agents: the ledger falls back to the null turn, which never resets
+  // on its own, so an over-budget call is still refused rather than allowed.
+  const { definition } = registered.tools.get(SAY_TOOL)
+  await definition.execute({ segments: ['a', 'b', 'c'] }, exec)
+  assert.equal(im.sent.length, 2)
+  await assert.rejects(() => definition.execute({ segments: ['d', 'e'] }, exec), /超过上限/)
 })
 
 test('an aborted signal stops the pacing wait', async () => {
