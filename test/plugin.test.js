@@ -412,6 +412,13 @@ test('a missed tool call triggers exactly one steering reminder', async () => {
   assert.equal(live.steered.length, 1, 'the model is asked once')
   assert.match(JSON.stringify(live.steered[0]), /reply-pacing/)
   assert.match(JSON.stringify(live.steered[0]), /dsh_im_say/)
+  // The steered message is spliced into the session log (`agent/inbox/spliced`),
+  // and the format-v4 reader refuses an inserted message without a producer-owned
+  // source kind; the shape validator also requires a message id. A reminder
+  // without them corrupted the whole session, so both are hard requirements.
+  assert.deepEqual(live.steered[0].source, { kind: 'user' })
+  assert.equal(typeof live.steered[0].id, 'string')
+  assert.ok(live.steered[0].id.length > 0)
   assert.equal(im.sent.length, 0, 'a reminder alone sends nothing')
 })
 

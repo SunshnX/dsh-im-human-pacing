@@ -3,6 +3,25 @@
 本项目的所有重要变更都会记录在这里，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.2] - 2026-11-22
+
+修复致命 bug：提醒消息会损坏会话日志，导致整个会话无法加载（`SessionFormatError: format v4 message requires a producer-owned source kind`）。
+
+### 根因
+
+`agent.steer()` 投递的消息会作为 `agent/inbox/spliced` 事件写进会话日志。format v4 的读取器要求每条插入消息都有 producer-owned 的 `source.kind`（且形状校验要求 `id`）。插件构造的提醒消息 `{ role, content }` 两者皆无——写入时不报错，**下次加载该会话时直接抛 `SessionFormatError`，会话永久拒载**。
+
+### 修复
+
+- 提醒消息补齐 `id: randomUUID()` 与 `source: { kind: 'user' }`，与真实用户消息同构。
+- 测试新增硬性断言：steer 出的消息必须带 `id` 和 `source.kind`，防止回归。
+
+### 受影响会话的修复
+
+已损坏的会话手工修复：解压多帧 zstd 日志、给缺字段的 inserted 消息补上 `id` + `source`、重新压缩。修复后 395 个事件全部通过 DSH 自身校验规则的等价验证。原损坏文件保留为 `session.v4.jsonl.zstd.corrupt-backup`。
+
+用例总数 53（新增 1 条断言）。
+
 ## [1.1.1] - 2026-11-22
 
 修复「最后一条与前面气泡衔接生硬」的问题：它听起来像对用户消息的重新回答，而不是前文的延续。

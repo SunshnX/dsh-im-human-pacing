@@ -13,6 +13,7 @@
  * @module dsh-im-human-pacing
  */
 
+import { randomUUID } from 'node:crypto'
 import {
   computeSendDelayMs,
   draftTargetFor,
@@ -234,7 +235,17 @@ function reminderMessage() {
     '它要和前面那几条连成同一口气，不要重新开头、不要重新回答用户。',
     '不要新增内容、不要解释这条提醒、不要提及工具。',
   ].join('\n')
-  return { role: 'user', content: [{ type: 'text', text }] }
+  // A steered message is spliced into the session log as an `agent/inbox/spliced`
+  // event, and the format-v4 reader refuses any inserted message whose source
+  // lacks a producer-owned `kind` (and the shape validator requires an `id`).
+  // A reminder without these fields corrupted the whole session on next load,
+  // so both fields are mandatory here, matching how real user messages look.
+  return {
+    role: 'user',
+    id: randomUUID(),
+    content: [{ type: 'text', text }],
+    source: { kind: 'user' },
+  }
 }
 
 /**
