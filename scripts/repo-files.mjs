@@ -18,6 +18,7 @@ const INCLUDE_DIRECTORIES = ['lib', 'locale', 'docs', 'test', 'scripts']
 /** Top-level files that belong in the repository. */
 const INCLUDE_FILES = [
   '.gitignore',
+  'CHANGELOG.md',
   'LICENSE',
   'README.md',
   'cordis.patch.yml',
