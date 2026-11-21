@@ -125,7 +125,7 @@ async function main() {
   // every write until one exists. Seeding a single file through the contents
   // API creates that first commit; the real tree then replaces both the file
   // and the branch tip.
-  let parents = []
+  let seededFirstCommit = false
   let tree = await api(token, 'POST', `${full}/git/trees`, { tree: treeEntries })
   if (tree.status === 409) {
     console.log('repository is empty; seeding the first commit')
@@ -134,20 +134,34 @@ async function main() {
       content: Buffer.from('* text=auto eol=lf\n', 'utf8').toString('base64'),
     })
     if (!seed.ok) fail(`cannot seed repository (${seed.status})`, seed.text)
-    const seeded = seed.data.commit.sha
-    if (seed.data.content?.path === '.gitattributes') {
-      treeEntries.push({
-        path: '.gitattributes',
-        mode: '100644',
-        type: 'blob',
-        content: '* text=auto eol=lf\n',
-      })
-    }
-    parents = [seeded]
+    treeEntries.push({
+      path: '.gitattributes',
+      mode: '100644',
+      type: 'blob',
+      content: '* text=auto eol=lf\n',
+    })
+    seededFirstCommit = true
     tree = await api(token, 'POST', `${full}/git/trees`, { tree: treeEntries })
   }
   if (!tree.ok) fail(`cannot create tree (${tree.status})`, tree.text)
   console.log(`uploaded ${treeEntries.length} blobs; tree ${tree.data.sha}`)
+
+  // Republishing must extend history, not rewrite it: an existing branch tip
+  // becomes the parent, and the seed commit is collapsed into this one.
+  let parents = []
+  const existingRef = await api(token, 'GET', `${full}/git/ref/heads/${options.branch}`)
+  if (existingRef.ok && existingRef.data?.object?.sha) {
+    parents = [existingRef.data.object.sha]
+    if (seededFirstCommit) {
+      const seedCommit = await api(token, 'GET', `${full}/git/commits/${existingRef.data.object.sha}`)
+      const seedParents = seedCommit.ok ? (seedCommit.data.parents ?? []) : []
+      parents = seedParents.map((parent) => parent.sha)
+      if (parents.length === 0) {
+        // Nothing to keep: the branch only holds the bootstrap commit.
+        console.log('replacing the bootstrap commit')
+      }
+    }
+  }
 
   const message = options.message ?? 'Initial commit: DSH plugin for human-paced IM replies'
   const commit = await api(token, 'POST', `${full}/git/commits`, {
@@ -156,14 +170,13 @@ async function main() {
     parents,
   })
   if (!commit.ok) fail(`cannot create commit (${commit.status})`, commit.text)
-  console.log(`created commit ${commit.data.sha}`)
+  console.log(`created commit ${commit.data.sha} (parents: ${parents.length})`)
 
-  const existingRef = await api(token, 'GET', `${full}/git/ref/heads/${options.branch}`)
   let ref
   if (existingRef.ok) {
     ref = await api(token, 'PATCH', `${full}/git/refs/heads/${options.branch}`, {
       sha: commit.data.sha,
-      force: true,
+      force: parents.length === 0,
     })
   } else {
     ref = await api(token, 'POST', `${full}/git/refs`, {
